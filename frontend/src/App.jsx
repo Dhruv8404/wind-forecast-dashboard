@@ -5,8 +5,8 @@ import ErrorChart from './components/ErrorChart';
 import IntervalsTable from './components/IntervalsTable';
 import InsightsPanel from './components/InsightsPanel';
 
-const API_BASE = 'http://127.0.0.1:8000';
-
+//const API_BASE = 'http://127.0.0.1:8000';
+const API_BASE = import.meta.env.VITE_API_BASE_URL;
 export default function App() {
   const [startDate, setStartDate] = useState('2026-01-01');
   const [endDate, setEndDate] = useState('2026-01-02');

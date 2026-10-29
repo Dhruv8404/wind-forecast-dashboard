@@ -1,0 +1,64 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UK Wind Generation Forecast Dashboard
+# ─────────────────────────────────────────────────────────────────────────────
+# Services:
+#   backend  — FastAPI + Uvicorn  → http://localhost:8000
+#   frontend — Vite build + Nginx → http://localhost:3000
+#
+# Usage:
+#   docker compose up --build          # build images and start
+#   docker compose up -d               # run in background
+#   docker compose down                # stop and remove containers
+#   docker compose logs -f backend     # stream backend logs
+#   docker compose logs -f frontend    # stream frontend (Nginx) logs
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Backend: FastAPI / Uvicorn ─────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: wind_backend
+    restart: unless-stopped
+    ports:
+      # Expose backend directly so you can still hit /docs and /api/* manually.
+      - "8000:8000"
+    environment:
+      # Python behaviour
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+      # Override this with a real .env file for production secrets/API keys.
+      - ENV=production
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - wind_net
+
+  # ── Frontend: Nginx serving Vite build ─────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: wind_frontend
+    restart: unless-stopped
+    ports:
+      # Dashboard accessible at http://localhost:3000
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - wind_net
+
+# ── Shared network ─────────────────────────────────────────────────────────
+networks:
+  wind_net:
+    driver: bridge

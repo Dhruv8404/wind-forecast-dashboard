@@ -5,8 +5,11 @@ import ErrorChart from './components/ErrorChart';
 import IntervalsTable from './components/IntervalsTable';
 import InsightsPanel from './components/InsightsPanel';
 
-//const API_BASE = 'http://127.0.0.1:8000';
-const API_BASE = import.meta.env.VITE_API_BASE_URL;
+const API_BASE = (
+  import.meta.env.VITE_API_BASE_URL ||
+  (import.meta.env.DEV ? '' : 'https://wind-forecast-dashboard-eq45.onrender.com')
+).replace(/\/+$/, '');
+
 export default function App() {
   const [startDate, setStartDate] = useState('2026-01-01');
   const [endDate, setEndDate] = useState('2026-01-02');
@@ -18,15 +21,8 @@ export default function App() {
     setLoading(true);
     setError(null);
     try {
-      // Use relative /api/accuracy when running behind Vite proxy or direct fallback to backend
-      const url = `/api/accuracy?start_date=${start}&end_date=${end}`;
-      let response;
-      try {
-        response = await fetch(url);
-      } catch (networkErr) {
-        // Fallback to direct backend URL if proxy is bypassed
-        response = await fetch(`${API_BASE}${url}`);
-      }
+      const endpoint = `${API_BASE}/api/accuracy?start_date=${start}&end_date=${end}`;
+      const response = await fetch(endpoint);
 
       if (!response.ok) {
         const errJson = await response.json().catch(() => ({}));

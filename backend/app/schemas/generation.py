@@ -1,5 +1,5 @@
 from datetime import date, datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -7,7 +7,7 @@ class ActualGenerationRecord(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     dataset: str = "FUELHH"
-    publish_time: Optional[datetime] = Field(None, alias="publishTime", description="When outturn was published")
+    publish_time: Optional[datetime] = Field(None, alias="publishTime", description="When outturn was published (UTC)")
     settlement_date: date = Field(..., alias="settlementDate", description="Settlement date (YYYY-MM-DD)")
     settlement_period: int = Field(..., alias="settlementPeriod", ge=1, le=50, description="Half-hour settlement period (1-50)")
     start_time: datetime = Field(..., alias="startTime", description="Start timestamp of the settlement period (UTC)")
@@ -26,31 +26,21 @@ class ForecastGenerationRecord(BaseModel):
     generation: float = Field(..., description="Forecasted wind generation in Megawatts (MW)")
 
 
-class AlignedForecastActual(BaseModel):
-    start_time: datetime = Field(..., description="Target settlement interval start time (UTC)")
-    settlement_date: date = Field(..., description="Settlement date")
-    settlement_period: int = Field(..., description="Settlement period (1-50)")
-    actual_generation_mw: float = Field(..., description="Actual wind generation (MW)")
-    forecast_generation_mw: float = Field(..., description="Selected forecast wind generation (MW)")
-    forecast_publish_time: datetime = Field(..., description="Timestamp when selected forecast was published (UTC)")
-    error_mw: float = Field(..., description="Forecast Error = Forecast - Actual (MW)")
-    abs_error_mw: float = Field(..., description="Absolute Error = |Forecast - Actual| (MW)")
-    percent_error: Optional[float] = Field(None, description="Percentage error relative to actual")
+class MatchedIntervalRecord(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
 
-
-class AccuracyMetrics(BaseModel):
-    sample_count: int = Field(..., description="Number of aligned settlement intervals evaluated")
-    mae: float = Field(..., description="Mean Absolute Error in MW (lower is better)")
-    rmse: float = Field(..., description="Root Mean Squared Error in MW (penalizes large misses)")
-    bias: float = Field(..., description="Mean Error in MW (positive = over-forecast, negative = under-forecast)")
-    mape: Optional[float] = Field(None, description="Mean Absolute Percentage Error (%)")
-    max_error_mw: float = Field(..., description="Maximum absolute error observed in MW")
-    actual_mean_mw: float = Field(..., description="Average actual wind generation across period in MW")
-    forecast_mean_mw: float = Field(..., description="Average forecast wind generation across period in MW")
+    start_time: datetime = Field(..., alias="startTime", description="Settlement interval start time (UTC)")
+    forecast_publish_time: Optional[datetime] = Field(None, alias="forecastPublishTime", description="When selected forecast was published (UTC)")
+    forecast: float = Field(..., description="Selected forecast generation (MW)")
+    actual: float = Field(..., description="Actual metered outturn (MW)")
+    error: float = Field(..., description="Forecast error = Forecast - Actual (MW)")
+    absolute_error: float = Field(..., alias="absoluteError", description="Absolute forecast error |Forecast - Actual| (MW)")
 
 
 class ActualsResponse(BaseModel):
     count: int
+    data_source: Literal["live", "synthetic"] = "live"
+    fallback_reason: Optional[str] = None
     fuel_type: str = "WIND"
     from_date: date
     to_date: date
@@ -59,15 +49,29 @@ class ActualsResponse(BaseModel):
 
 class ForecastsResponse(BaseModel):
     count: int
+    data_source: Literal["live", "synthetic"] = "live"
+    fallback_reason: Optional[str] = None
     publish_from: Optional[datetime] = None
     publish_to: Optional[datetime] = None
     cutoff_hours: Optional[float] = None
     data: List[ForecastGenerationRecord]
 
 
-class AccuracyResponse(BaseModel):
-    from_date: date
-    to_date: date
-    cutoff_hours: float
-    metrics: AccuracyMetrics
-    data_points: List[AlignedForecastActual]
+class AccuracyReportResponse(BaseModel):
+    dataset: str = "FUELHH + WINDFOR"
+    data_source: Literal["live", "synthetic"] = "live"
+    fallback_reason: Optional[str] = None
+    start_date: str
+    end_date: str
+    decision_cutoff: str
+    cutoff_hour: int = 10
+    count: int
+    mae: Optional[float] = None
+    rmse: Optional[float] = None
+    bias: Optional[float] = None
+    message: Optional[str] = None
+    intervals: List[MatchedIntervalRecord] = Field(default_factory=list)
+
+
+# Export aliases for backward compatibility
+AccuracyResponse = AccuracyReportResponse

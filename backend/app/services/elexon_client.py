@@ -1,13 +1,12 @@
 from datetime import date, datetime, timedelta, timezone
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 import httpx
 
+from app.config import settings
 from app.schemas.generation import ActualGenerationRecord, ForecastGenerationRecord
 
 logger = logging.getLogger(__name__)
-
-ELEXON_BASE_URL = "https://data.elexon.co.uk/bmrs/api/v1"
 
 
 class ElexonAPIError(Exception):
@@ -15,17 +14,41 @@ class ElexonAPIError(Exception):
     pass
 
 
+class DatasetResult:
+    """Container holding retrieved records along with lineage metadata."""
+    def __init__(
+        self,
+        records: List[Any],
+        data_source: Literal["live", "synthetic"] = "live",
+        fallback_reason: Optional[str] = None,
+    ):
+        self.records = records
+        self.data_source: Literal["live", "synthetic"] = data_source
+        self.fallback_reason = fallback_reason
+
+    def __iter__(self):
+        return iter((self.records, self.data_source, self.fallback_reason))
+
+
 def parse_datetime(val: Any) -> Optional[datetime]:
-    """Convert ISO datetime strings or datetime objects to UTC timezone-aware datetime."""
+    """Convert ISO datetime strings or datetime objects to normalized UTC timezone-aware datetime."""
     if val is None:
         return None
     if isinstance(val, datetime):
-        return val.replace(tzinfo=timezone.utc) if val.tzinfo is None else val.astimezone(timezone.utc)
+        dt = val.replace(tzinfo=timezone.utc) if val.tzinfo is None else val.astimezone(timezone.utc)
+        return dt.replace(second=0, microsecond=0)
     if isinstance(val, str):
-        cleaned = val.replace("Z", "+00:00")
+        cleaned = val.strip()
+        if not cleaned:
+            return None
+        cleaned = cleaned.replace("Z", "+00:00")
         try:
             dt = datetime.fromisoformat(cleaned)
-            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt.replace(second=0, microsecond=0)
         except Exception:
             return None
     return None
@@ -36,13 +59,14 @@ async def _fetch_dataset_chunk(
     chunk_start: date,
     chunk_end: date,
     client: httpx.AsyncClient,
+    fuel_type: Optional[str] = "WIND",
 ) -> List[Dict[str, Any]]:
     """Fetch a single chunk of data (<= 6 days) from Elexon BMRS datasets API."""
-    endpoint = f"{ELEXON_BASE_URL}/datasets/{dataset_name}"
-    
-    # Elexon routing constraint:
-    # WINDFOR requires publishDateTimeFrom / publishDateTimeTo
-    # FUELHH requires settlementDateFrom / settlementDateTo
+    endpoint = f"{settings.ELEXON_BASE_URL}/datasets/{dataset_name}"
+
+    # Elexon routing constraints:
+    # WINDFOR accepts publishDateTimeFrom / publishDateTimeTo
+    # FUELHH accepts settlementDateFrom / settlementDateTo and optional fuelType
     if dataset_name == "WINDFOR":
         from_dt = datetime(chunk_start.year, chunk_start.month, chunk_start.day, 0, 0, tzinfo=timezone.utc)
         to_dt = datetime(chunk_end.year, chunk_end.month, chunk_end.day, 23, 59, 59, tzinfo=timezone.utc)
@@ -55,12 +79,14 @@ async def _fetch_dataset_chunk(
             "settlementDateFrom": chunk_start.isoformat(),
             "settlementDateTo": chunk_end.isoformat(),
         }
+        if fuel_type:
+            params["fuelType"] = fuel_type.strip().upper()
 
     logger.info(f"fetch_dataset: requesting {endpoint} with {params}")
     response = await client.get(
         endpoint,
         params=params,
-        headers={"Accept": "application/json", "User-Agent": "WindForecastDashboard/1.0"},
+        headers={"Accept": "application/json", "User-Agent": "WindForecastDashboard/2.0"},
     )
     response.raise_for_status()
     payload = response.json()
@@ -74,42 +100,56 @@ async def fetch_dataset(
     dataset: str,
     start_date: date,
     end_date: date,
-    allow_fallback: bool = True,
-) -> List[Dict[str, Any]]:
+    allow_fallback: Optional[bool] = None,
+    fuel_type: Optional[str] = "WIND",
+) -> DatasetResult:
     """
     Fetch raw records for FUELHH or WINDFOR from the official Elexon Insights Solution API.
-    Elexon restricts date ranges to a maximum of 7 days; this function automatically
-    chunks large requests into <= 6-day intervals to prevent 400 Bad Request errors.
+    Chunks large date ranges into <= 6-day intervals to avoid Elexon's 7-day query ceiling.
+    Explicitly tracks whether data came from live Elexon API or synthetic fallback.
     """
+    if allow_fallback is None:
+        allow_fallback = settings.ALLOW_SYNTHETIC_FALLBACK
+
     dataset_name = dataset.strip().upper()
     all_records: List[Dict[str, Any]] = []
-    chunk_size_days = 6  # Safely within Elexon's 7-day query limit
+    chunk_size_days = 6
+    failure_reason: Optional[str] = None
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0)) as client:
+        timeout_cfg = httpx.Timeout(settings.ELEXON_TIMEOUT, connect=5.0)
+        async with httpx.AsyncClient(timeout=timeout_cfg) as client:
             current_start = start_date
             while current_start <= end_date:
                 current_end = min(current_start + timedelta(days=chunk_size_days), end_date)
-                chunk_items = await _fetch_dataset_chunk(dataset_name, current_start, current_end, client)
+                chunk_items = await _fetch_dataset_chunk(
+                    dataset_name, current_start, current_end, client, fuel_type=fuel_type
+                )
                 all_records.extend(chunk_items)
                 current_start = current_end + timedelta(days=1)
 
         if all_records:
-            logger.info(f"Successfully retrieved {len(all_records)} {dataset_name} records from Elexon")
-            return all_records
+            logger.info(f"Successfully retrieved {len(all_records)} {dataset_name} live records from Elexon")
+            return DatasetResult(records=all_records, data_source="live")
+        else:
+            failure_reason = f"Elexon BMRS API returned 0 records for {dataset_name} ({start_date} to {end_date})"
+            logger.warning(failure_reason)
 
     except Exception as exc:
-        logger.warning(f"fetch_dataset error for {dataset_name}: {exc}")
+        failure_reason = f"Elexon API connection error for {dataset_name}: {exc}"
+        logger.warning(failure_reason)
         if not allow_fallback:
-            raise ElexonAPIError(f"Failed to fetch dataset {dataset_name} from Elexon: {exc}") from exc
+            raise ElexonAPIError(failure_reason) from exc
 
-    # In case the Elexon API is unreachable, offline, or returns empty for the date range:
-    # generate realistic raw dict records so accuracy calculations and dashboards work reliably.
-    logger.info(f"Using fallback data generator for {dataset_name} ({start_date} to {end_date})")
+    if not allow_fallback:
+        raise ElexonAPIError(failure_reason or f"No records returned for {dataset_name}")
+
+    # Explicitly labeled synthetic fallback
+    logger.info(f"Engaging synthetic fallback generator for {dataset_name} ({start_date} to {end_date}): {failure_reason}")
     mock_client = ElexonClient()
     if dataset_name == "FUELHH":
-        mock_actuals = mock_client._generate_mock_actuals(start_date, end_date, "WIND")
-        return [
+        mock_actuals = mock_client._generate_mock_actuals(start_date, end_date, fuel_type or "WIND")
+        records = [
             {
                 "dataset": "FUELHH",
                 "startTime": a.start_time.isoformat(),
@@ -121,9 +161,14 @@ async def fetch_dataset(
             }
             for a in mock_actuals
         ]
+        return DatasetResult(
+            records=records,
+            data_source="synthetic",
+            fallback_reason=failure_reason,
+        )
     elif dataset_name == "WINDFOR":
         mock_forecasts = mock_client._generate_mock_forecasts(start_date, end_date)
-        return [
+        records = [
             {
                 "dataset": "WINDFOR",
                 "startTime": f.start_time.isoformat(),
@@ -134,36 +179,43 @@ async def fetch_dataset(
             }
             for f in mock_forecasts
         ]
-    return []
+        return DatasetResult(
+            records=records,
+            data_source="synthetic",
+            fallback_reason=failure_reason,
+        )
+    return DatasetResult(records=[], data_source="synthetic", fallback_reason="Unknown dataset requested")
 
 
 class ElexonClient:
-    """
-    Client for querying official Elexon BMRS API endpoints:
-    1. FUELHH: https://data.elexon.co.uk/bmrs/api/v1/datasets/FUELHH
-    2. Wind Forecast Latest: https://data.elexon.co.uk/bmrs/api/v1/forecast/generation/wind/latest
-    """
+    """Client for querying official Elexon BMRS API endpoints with resilience."""
 
-    def __init__(self, base_url: str = ELEXON_BASE_URL, timeout_seconds: float = 12.0):
+    def __init__(
+        self,
+        base_url: str = settings.ELEXON_BASE_URL,
+        timeout_seconds: float = settings.ELEXON_TIMEOUT,
+    ):
         self.base_url = base_url.rstrip("/")
-        self.timeout = httpx.Timeout(timeout_seconds, connect=4.0)
+        self.timeout = httpx.Timeout(timeout_seconds, connect=5.0)
 
     async def fetch_fuelhh_actuals(
         self,
         from_date: date,
         to_date: date,
         fuel_type: str = "WIND",
-        allow_fallback: bool = True,
-    ) -> List[ActualGenerationRecord]:
+        allow_fallback: Optional[bool] = None,
+    ) -> DatasetResult:
         """
-        Fetch generation outturn from https://data.elexon.co.uk/bmrs/api/v1/datasets/FUELHH
+        Fetch generation outturn from Elexon FUELHH.
         Filters for the specified fuel type (default: WIND).
         """
-        raw_items = await fetch_dataset("FUELHH", from_date, to_date, allow_fallback=allow_fallback)
+        result = await fetch_dataset(
+            "FUELHH", from_date, to_date, allow_fallback=allow_fallback, fuel_type=fuel_type
+        )
         records: List[ActualGenerationRecord] = []
         target_fuel = fuel_type.strip().upper()
 
-        for item in raw_items:
+        for item in result.records:
             item_fuel = str(item.get("fuelType", "")).strip().upper()
             if item_fuel == target_fuel:
                 dt = parse_datetime(item.get("startTime"))
@@ -183,12 +235,17 @@ class ElexonClient:
                 )
 
         if records:
-            return records
+            return DatasetResult(records, data_source=result.data_source, fallback_reason=result.fallback_reason)
 
-        if not allow_fallback:
+        if not (allow_fallback if allow_fallback is not None else settings.ALLOW_SYNTHETIC_FALLBACK):
             raise ElexonAPIError(f"No {fuel_type} records returned from Elexon FUELHH endpoint")
 
-        return self._generate_mock_actuals(from_date, to_date, fuel_type)
+        mock_actuals = self._generate_mock_actuals(from_date, to_date, fuel_type)
+        return DatasetResult(
+            mock_actuals,
+            data_source="synthetic",
+            fallback_reason=f"No matching {fuel_type} records found in FUELHH payload",
+        )
 
     async def fetch_windfor_forecasts(
         self,
@@ -196,24 +253,27 @@ class ElexonClient:
         publish_to: Optional[datetime] = None,
         target_from_date: Optional[date] = None,
         target_to_date: Optional[date] = None,
-        allow_fallback: bool = True,
-    ) -> List[ForecastGenerationRecord]:
-        """
-        Fetch wind forecasts from WINDFOR dataset / latest endpoint.
-        """
+        allow_fallback: Optional[bool] = None,
+    ) -> DatasetResult:
+        """Fetch wind forecasts from WINDFOR dataset."""
         start_d = target_from_date or (date.today() - timedelta(days=2))
         end_d = target_to_date or date.today()
 
-        raw_items = await fetch_dataset("WINDFOR", start_d, end_d, allow_fallback=allow_fallback)
-        records = self._parse_forecast_items(raw_items)
+        result = await fetch_dataset("WINDFOR", start_d, end_d, allow_fallback=allow_fallback)
+        records = self._parse_forecast_items(result.records)
 
         if records:
-            return records
+            return DatasetResult(records, data_source=result.data_source, fallback_reason=result.fallback_reason)
 
-        if not allow_fallback:
+        if not (allow_fallback if allow_fallback is not None else settings.ALLOW_SYNTHETIC_FALLBACK):
             raise ElexonAPIError("No forecast records returned from Elexon WINDFOR endpoint")
 
-        return self._generate_mock_forecasts(start_d, end_d)
+        mock_forecasts = self._generate_mock_forecasts(start_d, end_d)
+        return DatasetResult(
+            mock_forecasts,
+            data_source="synthetic",
+            fallback_reason="No valid forecast records in WINDFOR payload",
+        )
 
     @staticmethod
     def _parse_forecast_items(items: Any) -> List[ForecastGenerationRecord]:
@@ -280,9 +340,8 @@ class ElexonClient:
     @staticmethod
     def _generate_mock_forecasts(from_date: date, to_date: date) -> List[ForecastGenerationRecord]:
         """
-        Generate multiple forecast runs (Day-Ahead at 08:00 D-1, 4h-ahead, 1h-ahead)
+        Generate multiple forecast runs (Day-Ahead at 08:30 D-1, 4h-ahead, 1h-ahead)
         preserving distinct publishTime and target startTime.
-        Ensures forecasts exist strictly prior to the 10:00 UTC day-ahead cutoff.
         """
         import math
         records: List[ForecastGenerationRecord] = []

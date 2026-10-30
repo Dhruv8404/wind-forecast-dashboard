@@ -5,6 +5,10 @@ FROM node:20-slim AS builder
 
 WORKDIR /app
 
+# Optional build argument to override API base if needed
+ARG VITE_API_BASE_URL=""
+ENV VITE_API_BASE_URL=$VITE_API_BASE_URL
+
 # Install dependencies first (cached layer).
 COPY package.json package-lock.json* ./
 RUN npm ci

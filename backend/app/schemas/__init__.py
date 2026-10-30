@@ -1,19 +1,19 @@
 from app.schemas.generation import (
     ActualGenerationRecord,
     ForecastGenerationRecord,
-    AlignedForecastActual,
-    AccuracyMetrics,
+    MatchedIntervalRecord,
     ActualsResponse,
     ForecastsResponse,
+    AccuracyReportResponse,
     AccuracyResponse,
 )
 
 __all__ = [
     "ActualGenerationRecord",
     "ForecastGenerationRecord",
-    "AlignedForecastActual",
-    "AccuracyMetrics",
+    "MatchedIntervalRecord",
     "ActualsResponse",
     "ForecastsResponse",
+    "AccuracyReportResponse",
     "AccuracyResponse",
 ]

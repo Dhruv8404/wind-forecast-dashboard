@@ -4,7 +4,7 @@ from fastapi import HTTPException
 
 from app.api.accuracy import get_forecast_accuracy
 from app.services.accuracy_service import calculate_accuracy, parse_datetime
-from app.services.elexon_client import ElexonClient, parse_datetime as elexon_parse_dt
+from app.services.elexon_client import ElexonClient, DatasetResult, parse_datetime as elexon_parse_dt
 
 
 def test_calculate_accuracy_basic():
@@ -163,3 +163,76 @@ def test_api_date_validation():
             pass
     assert exc_info.value.status_code == 400
     assert "end_date must not be before start_date" in exc_info.value.detail
+
+
+def test_bias_sign_convention_under_and_over():
+    """
+    Verify the sign convention for Bias:
+    Forecast > Actual => Positive Bias (Over-forecasting)
+    Forecast < Actual => Negative Bias (Under-forecasting)
+    """
+    actuals = [{"startTime": "2026-01-02T10:00:00Z", "generation": 1000.0}]
+
+    # Case 1: Over-forecasting by 250 MW
+    over_forecasts = [
+        {"startTime": "2026-01-02T10:00:00Z", "publishTime": "2026-01-01T08:00:00Z", "generation": 1250.0}
+    ]
+    res_over = calculate_accuracy(actuals, over_forecasts)
+    assert res_over["error" if "error" in res_over else "bias"] == 250.0
+    assert res_over["mae"] == 250.0
+    assert res_over["rmse"] == 250.0
+
+    # Case 2: Under-forecasting by 200 MW
+    under_forecasts = [
+        {"startTime": "2026-01-02T10:00:00Z", "publishTime": "2026-01-01T08:00:00Z", "generation": 800.0}
+    ]
+    res_under = calculate_accuracy(actuals, under_forecasts)
+    assert res_under["bias"] == -200.0
+    assert res_under["mae"] == 200.0
+    assert res_under["rmse"] == 200.0
+
+
+def test_forecast_duplicate_selection_latest():
+    """Verify that among multiple eligible forecasts before cutoff, the latest published run is chosen."""
+    actuals = [{"startTime": "2026-01-02T12:00:00Z", "generation": 500.0}]
+    forecasts = [
+        {"startTime": "2026-01-02T12:00:00Z", "publishTime": "2026-01-01T04:00:00Z", "generation": 450.0},
+        {"startTime": "2026-01-02T12:00:00Z", "publishTime": "2026-01-01T09:30:00Z", "generation": 520.0}, # Latest before 10:00
+        {"startTime": "2026-01-02T12:00:00Z", "publishTime": "2026-01-01T07:15:00Z", "generation": 480.0},
+    ]
+    res = calculate_accuracy(actuals, forecasts, cutoff_hour=10)
+    assert res["count"] == 1
+    assert res["intervals"][0]["forecast"] == 520.0
+    assert res["intervals"][0]["forecastPublishTime"] == "2026-01-01T09:30:00+00:00"
+
+
+def test_configurable_cutoff_hour():
+    """Verify that changing cutoff_hour changes which forecasts are eligible."""
+    actuals = [{"startTime": "2026-01-02T12:00:00Z", "generation": 500.0}]
+    # Forecast published at 11:00 UTC D-1
+    forecasts = [
+        {"startTime": "2026-01-02T12:00:00Z", "publishTime": "2026-01-01T11:00:00Z", "generation": 530.0}
+    ]
+
+    # With cutoff 09:00 UTC D-1 -> Ineligible (count 0)
+    res_09 = calculate_accuracy(actuals, forecasts, cutoff_hour=9)
+    assert res_09["count"] == 0
+
+    # With cutoff 12:00 UTC D-1 -> Eligible (count 1)
+    res_12 = calculate_accuracy(actuals, forecasts, cutoff_hour=12)
+    assert res_12["count"] == 1
+    assert res_12["intervals"][0]["forecast"] == 530.0
+
+
+def test_dataset_result_lineage_tracking():
+    """Verify DatasetResult object properly reports data_source and fallback_reason."""
+    res_live = DatasetResult(records=[1, 2, 3], data_source="live")
+    assert res_live.data_source == "live"
+    assert res_live.fallback_reason is None
+    rec, src, reason = res_live
+    assert len(rec) == 3
+    assert src == "live"
+
+    res_mock = DatasetResult(records=[], data_source="synthetic", fallback_reason="Timeout")
+    assert res_mock.data_source == "synthetic"
+    assert res_mock.fallback_reason == "Timeout"
